@@ -196,6 +196,20 @@ async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
         return []
 
 async def get_top_search_results(page: Page, query: str, limit: int, debug: bool, debug_dir: Path, sku: str) -> List[str]:
+    async def _has_product_candidates() -> bool:
+        try:
+            candidate_selectors = [
+                "article[data-testid='product-card'] a[href]",
+                "a[data-qa='plp-product-link']",
+                "a[data-testid='product-link']",
+            ]
+            for sel in candidate_selectors:
+                if await page.locator(sel).count() > 0:
+                    return True
+            return False
+        except Exception:
+            return False
+
     url = SEARCH_URL.format(q=query.replace(" ", "+"))
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     try:
@@ -219,8 +233,8 @@ async def get_top_search_results(page: Page, query: str, limit: int, debug: bool
 
     try:
         await page.wait_for_selector(
-            '#plp-root, div[data-testid="search-results"], a[data-testid="product-link"]',
-            timeout=9000
+            "article[data-testid='product-card'] a[href], a[data-qa='plp-product-link'], a[data-testid='product-link'], text='Access to this page has been denied', text='Please verify you are a human'",
+            timeout=12000,
         )
     except PlaywrightTimeoutError:
         pass
@@ -428,6 +442,9 @@ async def run(args):
                     else:
                         print(f"  ↪ retrying… (attempt {attempt+1}/2)")
                         sleep_jitter(2.2, 1.2)
+                except DataDomeChallengeError:
+                    print("  ⚠️ DataDome challenge persists; skipping further retries for this query.")
+                    break
                 except Exception as e:
                     print(f"  retry {attempt+1} error: {e}")
                     sleep_jitter(2.5, 1.2)
