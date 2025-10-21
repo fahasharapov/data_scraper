@@ -27,6 +27,7 @@ from playwright.async_api import (
 )
 
 SEARCH_URL = "https://www.zoro.com/search?q={q}"
+HOME_URL = "https://www.zoro.com/"
 
 # ---------------- Utilities ----------------
 def sleep_jitter(base=2.0, spread=1.2):
@@ -118,6 +119,46 @@ async def gentle_autoscroll(page: Page, max_rounds: int = 10, wait_ms_min: int =
         prev_count = count
 
 # ---------------- Link Collection ----------------
+async def is_datadome_challenge(page: Page) -> bool:
+    """Return True when the current page is the DataDome captcha challenge."""
+    try:
+        url = page.url.lower()
+        if any(token in url for token in ("captcha-delivery.com", "/captcha/", "/deny/")):
+            return True
+
+        if await page.locator("iframe[src*='captcha-delivery.com']").count() > 0:
+            return True
+
+        if await page.locator("input[name='datadome']").count() > 0:
+            return True
+
+        content = await page.content()
+        challenge_markers = (
+            "Access to this page has been denied",
+            "Please verify you are a human",
+        )
+        text = content.lower()
+        return any(marker.lower() in text for marker in challenge_markers)
+    except Exception:
+        return False
+
+async def refresh_session_cookie(page: Page) -> bool:
+    try:
+        await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        return False
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(900 + random.randint(0, 600))
+    await human_mouse_move(page)
+    try:
+        await page.wait_for_selector("body", timeout=3000)
+    except PlaywrightTimeoutError:
+        pass
+    return not await is_datadome_challenge(page)
+
 async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
     try:
         js = f"""() => {{
@@ -157,6 +198,22 @@ async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
 async def get_top_search_results(page: Page, query: str, limit: int, debug: bool, debug_dir: Path, sku: str) -> List[str]:
     url = SEARCH_URL.format(q=query.replace(" ", "+"))
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
+    if await is_datadome_challenge(page):
+        print("  ⚠️ DataDome challenge detected; refreshing session…")
+        if await refresh_session_cookie(page):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            print("  ⚠️ Unable to refresh session; challenge persists.")
+    if await is_datadome_challenge(page):
+        return []
     await page.wait_for_timeout(800 + random.randint(0, 900))
     await human_mouse_move(page)
 
@@ -168,8 +225,19 @@ async def get_top_search_results(page: Page, query: str, limit: int, debug: bool
     except PlaywrightTimeoutError:
         pass
 
+    try:
+        await page.wait_for_selector(
+            'article[data-testid="product-card"] a[href], a[data-qa="plp-product-link"], a[href*="/i/"]',
+            timeout=12000
+        )
+    except PlaywrightTimeoutError:
+        pass
+
     await gentle_autoscroll(page)
     links = await collect_links_dom_and_shadow(page, limit=limit)
+    if not links:
+        await page.wait_for_timeout(1200)
+        links = await collect_links_dom_and_shadow(page, limit=limit)
 
     # Debug capture when nothing found
     if debug and not links:
@@ -338,6 +406,7 @@ async def run(args):
         await context.add_init_script(STEALTH_INIT_SCRIPT)
 
         page = await context.new_page()
+        await refresh_session_cookie(page)
         total_items = len(df.index)
 
         for idx, r in df.iterrows():
