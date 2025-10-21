@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 from playwright.async_api import (
@@ -28,6 +28,7 @@ from playwright.async_api import (
 
 SEARCH_URL = "https://www.zoro.com/search?q={q}"
 HOME_URL = "https://www.zoro.com/"
+
 
 # ---------------- Utilities ----------------
 def sleep_jitter(base=2.0, spread=1.2):
@@ -119,6 +120,18 @@ async def gentle_autoscroll(page: Page, max_rounds: int = 10, wait_ms_min: int =
         prev_count = count
 
 # ---------------- Link Collection ----------------
+async def _is_visible(page: Page, selector: str, timeout: int = 1000) -> bool:
+    loc = page.locator(selector)
+    if await loc.count() == 0:
+        return False
+    try:
+        return await loc.first.is_visible(timeout=timeout)
+    except PlaywrightTimeoutError:
+        return False
+    except Exception:
+        return False
+
+
 async def is_datadome_challenge(page: Page) -> bool:
     """Return True when the current page is the DataDome captcha challenge."""
     try:
@@ -126,6 +139,18 @@ async def is_datadome_challenge(page: Page) -> bool:
         if any(token in url for token in ("captcha-delivery.com", "/captcha/", "/deny/")):
             return True
 
+        challenge_selectors = [
+            "form#captcha-form",
+            "form[action*='datadome']",
+            "div[class*='captcha'] >> text=/please verify/i",
+            "text=/Access to this page has been denied/i",
+            "text=/Please verify you are a human/i",
+            "iframe[src*='captcha-delivery.com']",
+        ]
+        for sel in challenge_selectors:
+            if await _is_visible(page, sel):
+                return True
+        return False
         if await page.locator("iframe[src*='captcha-delivery.com']").count() > 0:
             return True
 
@@ -143,6 +168,10 @@ async def is_datadome_challenge(page: Page) -> bool:
         return False
 
 async def refresh_session_cookie(page: Page) -> bool:
+    try:
+        await page.context.clear_cookies()
+    except Exception:
+        pass
     try:
         await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
     except Exception:
@@ -195,6 +224,14 @@ async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
     except Exception:
         return []
 
+async def get_top_search_results(
+    page: Page,
+    query: str,
+    limit: int,
+    debug: bool,
+    debug_dir: Path,
+    sku: str,
+) -> Tuple[List[str], bool]:
 async def get_top_search_results(page: Page, query: str, limit: int, debug: bool, debug_dir: Path, sku: str) -> List[str]:
     async def _has_product_candidates() -> bool:
         try:
@@ -247,6 +284,31 @@ async def get_top_search_results(page: Page, query: str, limit: int, debug: bool
     except PlaywrightTimeoutError:
         pass
 
+    if await is_datadome_challenge(page) and not await _has_product_candidates():
+        print("  ⚠️ DataDome challenge detected; refreshing session…")
+        if await refresh_session_cookie(page):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                await page.wait_for_selector(
+                    "article[data-testid='product-card'] a[href], a[data-qa='plp-product-link'], a[data-testid='product-link']",
+                    timeout=12000,
+                )
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            print("  ⚠️ Unable to refresh session; challenge persists.")
+            return [], True
+
+    if await is_datadome_challenge(page) and not await _has_product_candidates():
+        return [], True
+
+    await page.wait_for_timeout(800 + random.randint(0, 900))
+    await human_mouse_move(page)
+
     await gentle_autoscroll(page)
     links = await collect_links_dom_and_shadow(page, limit=limit)
     if not links:
@@ -271,7 +333,7 @@ async def get_top_search_results(page: Page, query: str, limit: int, debug: bool
     # Log count
     if links:
         print(f"  Found {len(links)} raw link(s); taking top {min(limit, len(links))}.")
-    return links[:limit]
+    return links[:limit], False
 
 # ---------------- Product Extraction ----------------
 async def extract_listing_details(context, url: str, search_query: str, debug: bool, debug_dir: Path, sku: str, idx: int) -> Dict[str, Any]:
@@ -433,10 +495,21 @@ async def run(args):
             print(f"[{idx+1}/{total_items}] Searching for: {query}")
             sleep_jitter(1.5, 1.0)
             links = []
+            challenge_persisted = False
 
             for attempt in range(2):
                 try:
-                    links = await get_top_search_results(page, query, limit=limit, debug=args.debug, debug_dir=debug_dir, sku=sku)
+                    links, challenge_persisted = await get_top_search_results(
+                        page,
+                        query,
+                        limit=limit,
+                        debug=args.debug,
+                        debug_dir=debug_dir,
+                        sku=sku,
+                    )
+                    if challenge_persisted:
+                        print("  ⚠️ DataDome challenge persists; skipping further retries for this query.")
+                        break
                     if links:
                         break
                     else:
