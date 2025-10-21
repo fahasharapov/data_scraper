@@ -151,6 +151,19 @@ async def is_datadome_challenge(page: Page) -> bool:
             if await _is_visible(page, sel):
                 return True
         return False
+        if await page.locator("iframe[src*='captcha-delivery.com']").count() > 0:
+            return True
+
+        if await page.locator("input[name='datadome']").count() > 0:
+            return True
+
+        content = await page.content()
+        challenge_markers = (
+            "Access to this page has been denied",
+            "Please verify you are a human",
+        )
+        text = content.lower()
+        return any(marker.lower() in text for marker in challenge_markers)
     except Exception:
         return False
 
@@ -219,6 +232,7 @@ async def get_top_search_results(
     debug_dir: Path,
     sku: str,
 ) -> Tuple[List[str], bool]:
+async def get_top_search_results(page: Page, query: str, limit: int, debug: bool, debug_dir: Path, sku: str) -> List[str]:
     async def _has_product_candidates() -> bool:
         try:
             candidate_selectors = [
@@ -239,11 +253,33 @@ async def get_top_search_results(
         await page.wait_for_load_state("networkidle", timeout=15000)
     except PlaywrightTimeoutError:
         pass
+    if await is_datadome_challenge(page):
+        print("  ⚠️ DataDome challenge detected; refreshing session…")
+        if await refresh_session_cookie(page):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            print("  ⚠️ Unable to refresh session; challenge persists.")
+    if await is_datadome_challenge(page):
+        return []
+    await page.wait_for_timeout(800 + random.randint(0, 900))
+    await human_mouse_move(page)
 
     try:
         await page.wait_for_selector(
             "article[data-testid='product-card'] a[href], a[data-qa='plp-product-link'], a[data-testid='product-link'], text='Access to this page has been denied', text='Please verify you are a human'",
             timeout=12000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+    try:
+        await page.wait_for_selector(
+            'article[data-testid="product-card"] a[href], a[data-qa="plp-product-link"], a[href*="/i/"]',
+            timeout=12000
         )
     except PlaywrightTimeoutError:
         pass
@@ -479,6 +515,9 @@ async def run(args):
                     else:
                         print(f"  ↪ retrying… (attempt {attempt+1}/2)")
                         sleep_jitter(2.2, 1.2)
+                except DataDomeChallengeError:
+                    print("  ⚠️ DataDome challenge persists; skipping further retries for this query.")
+                    break
                 except Exception as e:
                     print(f"  retry {attempt+1} error: {e}")
                     sleep_jitter(2.5, 1.2)
