@@ -27,6 +27,11 @@ from playwright.async_api import (
 )
 
 SEARCH_URL = "https://www.zoro.com/search?q={q}"
+HOME_URL = "https://www.zoro.com/"
+
+
+class DataDomeChallengeError(Exception):
+    """Raised when the DataDome challenge persists and we should stop retrying."""
 
 # ---------------- Utilities ----------------
 def sleep_jitter(base=2.0, spread=1.2):
@@ -118,6 +123,61 @@ async def gentle_autoscroll(page: Page, max_rounds: int = 10, wait_ms_min: int =
         prev_count = count
 
 # ---------------- Link Collection ----------------
+async def _is_visible(page: Page, selector: str, timeout: int = 1000) -> bool:
+    loc = page.locator(selector)
+    if await loc.count() == 0:
+        return False
+    try:
+        return await loc.first.is_visible(timeout=timeout)
+    except PlaywrightTimeoutError:
+        return False
+    except Exception:
+        return False
+
+
+async def is_datadome_challenge(page: Page) -> bool:
+    """Return True when the current page is the DataDome captcha challenge."""
+    try:
+        url = page.url.lower()
+        if any(token in url for token in ("captcha-delivery.com", "/captcha/", "/deny/")):
+            return True
+
+        challenge_selectors = [
+            "form#captcha-form",
+            "form[action*='datadome']",
+            "div[class*='captcha'] >> text=/please verify/i",
+            "text=/Access to this page has been denied/i",
+            "text=/Please verify you are a human/i",
+            "iframe[src*='captcha-delivery.com']",
+        ]
+        for sel in challenge_selectors:
+            if await _is_visible(page, sel):
+                return True
+        return False
+    except Exception:
+        return False
+
+async def refresh_session_cookie(page: Page) -> bool:
+    try:
+        await page.context.clear_cookies()
+    except Exception:
+        pass
+    try:
+        await page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+    except Exception:
+        return False
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(900 + random.randint(0, 600))
+    await human_mouse_move(page)
+    try:
+        await page.wait_for_selector("body", timeout=3000)
+    except PlaywrightTimeoutError:
+        pass
+    return not await is_datadome_challenge(page)
+
 async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
     try:
         js = f"""() => {{
@@ -155,21 +215,65 @@ async def collect_links_dom_and_shadow(page: Page, limit: int = 5) -> List[str]:
         return []
 
 async def get_top_search_results(page: Page, query: str, limit: int, debug: bool, debug_dir: Path, sku: str) -> List[str]:
+    async def _has_product_candidates() -> bool:
+        try:
+            candidate_selectors = [
+                "article[data-testid='product-card'] a[href]",
+                "a[data-qa='plp-product-link']",
+                "a[data-testid='product-link']",
+            ]
+            for sel in candidate_selectors:
+                if await page.locator(sel).count() > 0:
+                    return True
+            return False
+        except Exception:
+            return False
+
     url = SEARCH_URL.format(q=query.replace(" ", "+"))
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(800 + random.randint(0, 900))
-    await human_mouse_move(page)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
 
     try:
         await page.wait_for_selector(
-            '#plp-root, div[data-testid="search-results"], a[data-testid="product-link"]',
-            timeout=9000
+            "article[data-testid='product-card'] a[href], a[data-qa='plp-product-link'], a[data-testid='product-link'], text='Access to this page has been denied', text='Please verify you are a human'",
+            timeout=12000,
         )
     except PlaywrightTimeoutError:
         pass
 
+    if await is_datadome_challenge(page) and not await _has_product_candidates():
+        print("  ⚠️ DataDome challenge detected; refreshing session…")
+        if await refresh_session_cookie(page):
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                await page.wait_for_selector(
+                    "article[data-testid='product-card'] a[href], a[data-qa='plp-product-link'], a[data-testid='product-link']",
+                    timeout=12000,
+                )
+            except PlaywrightTimeoutError:
+                pass
+        else:
+            print("  ⚠️ Unable to refresh session; challenge persists.")
+            raise DataDomeChallengeError("refresh failed")
+
+    if await is_datadome_challenge(page) and not await _has_product_candidates():
+        raise DataDomeChallengeError("challenge persists")
+
+    await page.wait_for_timeout(800 + random.randint(0, 900))
+    await human_mouse_move(page)
+
     await gentle_autoscroll(page)
     links = await collect_links_dom_and_shadow(page, limit=limit)
+    if not links:
+        await page.wait_for_timeout(1200)
+        links = await collect_links_dom_and_shadow(page, limit=limit)
 
     # Debug capture when nothing found
     if debug and not links:
@@ -338,6 +442,7 @@ async def run(args):
         await context.add_init_script(STEALTH_INIT_SCRIPT)
 
         page = await context.new_page()
+        await refresh_session_cookie(page)
         total_items = len(df.index)
 
         for idx, r in df.iterrows():
@@ -359,6 +464,9 @@ async def run(args):
                     else:
                         print(f"  ↪ retrying… (attempt {attempt+1}/2)")
                         sleep_jitter(2.2, 1.2)
+                except DataDomeChallengeError:
+                    print("  ⚠️ DataDome challenge persists; skipping further retries for this query.")
+                    break
                 except Exception as e:
                     print(f"  retry {attempt+1} error: {e}")
                     sleep_jitter(2.5, 1.2)
